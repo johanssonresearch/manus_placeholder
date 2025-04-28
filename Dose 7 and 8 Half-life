@@ -1,0 +1,424 @@
+# Dose 7 half life analysis
+
+
+# Filter and prepare Nuvaxovid and Comirnaty groups
+df_long_cohort <- df_long %>%
+  filter(date_dose >= ymd("2023-09-01"), date_dose <= ymd("2024-02-01")) %>%
+  rename(vaccine_date = date_dose) %>%
+  group_by(Civicnumber) %>%
+  # Select the row with the latest Infection_date; use date_dose as a tiebreaker
+  slice_max(order_by = c(Infection_date), with_ties = FALSE) %>%
+  ungroup()
+
+
+
+# # Civicnummbers vaccinated between 2024-03-01 - 2024-07-01
+# df_vaccinated_in_interval <- df_long %>%
+#   filter(date_dose >= ymd("2024-03-01"), date_dose <= ymd("2024-07-01"))
+
+
+
+df_total <- merge(df_long_cohort, df_lab)
+df_total <- df_total %>% distinct(Civicnumber, Referencenumber_sample_Direkttest, .keep_all = T)
+
+df_total %>% group_by(vaccine_date) %>% count() %>% print(n = Inf)
+df_total %>% group_by(Sampling.date_S.ELISA) %>% count() %>% print(n = Inf)
+# Choose those with 2 or more samples with valid lab data on day 21, or more,  after vaccination
+df_samples <- df_total %>% filter(Sampling.date_S.ELISA > vaccine_date + 21, !is.na(IgG_WT.Spike_Panel25_Mesoscale_AU.ml)) 
+
+
+df_samples %>% group_by(vaccine_date) %>% count() %>% print(n = Inf)
+df_samples %>% group_by(Sampling.date_S.ELISA) %>% count() %>% print(n = Inf)
+
+
+
+filtered_df <- df_samples %>%
+  arrange(Civicnumber, Sampling.date_S.ELISA) %>%  # Ensure data is ordered by individual and date
+  mutate(
+    diff_days = as.numeric(Sampling.date_S.ELISA - vaccine_date)              # Difference in days
+  )
+
+
+filtered_df %>% group_by(diff_days) %>% count() %>% print(n = Inf)
+
+
+
+# Fit the linear regression model
+lm_model_log <- lm(log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml) ~ diff_days, data = filtered_df )
+
+
+
+# Summary of the model
+summary(lm_model_log)
+
+# Extract the slope (decay rate)
+k <- coef(lm_model_log)["diff_days"]  # Slope of diff_days
+
+# Calculate half-life
+half_life <- log(2) / abs(k)
+
+# Print the half-life
+cat("The half-life of the lab value is approximately", round(half_life, 2), "days.\n")
+
+
+ggplot(filtered_df, aes(x = diff_days, y = log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml))) +
+  geom_point(alpha = 0.5, color = "blue") +  # Scatter plot with transparency
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Linear regression line
+  labs(
+    x = "Days Since Vaccination",
+    y = "Log IgG WT Spike Panel (AU/ml)",
+    title = "Log-transformed IgG WT Spike vs. Days Since Vaccination"
+  ) +
+  mitt_tema  # Apply your custom theme
+
+
+
+##saveRDS(1 - k,"DATA/misc/rate of WT decline.RDS")
+
+
+# Define cluster groups
+filtered_df <- filtered_df %>%
+  mutate(cluster_group = case_when(
+    diff_days >= 0 & diff_days <= 100   ~ "0-100",
+    diff_days >= 120 & diff_days <= 240 ~ "120-240",
+    diff_days >= 250 & diff_days <= 350 ~ "250-350",
+    TRUE ~ NA_character_  # Exclude values outside these ranges
+  )) %>%
+  filter(!is.na(cluster_group))  # Remove NA clusters
+
+# Calculate half-life for each cluster
+half_life_df <- filtered_df %>%
+  group_by(cluster_group) %>%
+  summarise(
+    k = coef(lm(log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml) ~ diff_days, data = cur_data()))["diff_days"],
+    half_life = log(2) / abs(k),  # Ensure half-life is positive
+    x_pos = mean(range(diff_days)),  # Place label at center of cluster range
+    y_pos = max(log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml), na.rm = TRUE) - 0.2  # Slightly below max Y value
+  )
+
+# Merge half-life data with original data
+filtered_df <- filtered_df %>%
+  left_join(half_life_df, by = "cluster_group")
+
+# Create plot
+ggplot(filtered_df, aes(x = diff_days, y = log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml), color = cluster_group)) +
+  geom_point(alpha = 0.5) +  # Scatter plot
+  geom_smooth(method = "lm", se = TRUE) +  # Separate regression lines
+  geom_text(data = half_life_df, aes(x = x_pos, y = y_pos, 
+                                     label = paste("t½:", round(half_life, 1), "days"), color = cluster_group), 
+            size = 5, fontface = "bold", show.legend = FALSE) +  # Annotate half-life
+  labs(
+    x = "Days Since Vaccination",
+    y = "Log IgG WT Spike Panel (AU/ml)",
+    title = "Log IgG WT Spike vs. Days Since Vaccination (Clustered Half-Life)",
+    color = "Cluster Group"
+  ) +
+  mitt_tema  # Apply your custom theme
+
+
+#############
+
+# Define cumulative model groups WITHOUT filtering points
+df_models <- filtered_df %>%
+  mutate(model_group = case_when(
+    diff_days <= 100  ~ "0-100",
+    diff_days <= 240  ~ "0-240",
+    diff_days <= 350  ~ "0-350"
+  ))
+
+# Fit separate linear models for the cumulative ranges
+lm_models <- df_models %>%
+  group_by(model_group) %>%
+  summarise(
+    k = coef(lm(log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml) ~ diff_days, data = cur_data()))["diff_days"],
+    half_life = log(2) / abs(k),  # Compute half-life
+    x_pos = mean(range(diff_days)),  # Center label within the range
+    y_pos = max(log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml), na.rm = TRUE) - 0.2  # Slightly below max Y value
+  )
+
+# Create plot
+ggplot(filtered_df, aes(x = diff_days, y = log(IgG_WT.Spike_Panel25_Mesoscale_AU.ml))) +
+  geom_point(alpha = 0.5, color = "black") +  # Show all points in black
+  geom_smooth(data = filtered_df %>% filter(diff_days <= 100), aes(color = "0-100"), method = "lm", se = TRUE) +
+  geom_smooth(data = filtered_df %>% filter(diff_days <= 240), aes(color = "0-240"), method = "lm", se = TRUE) +
+  geom_smooth(data = filtered_df %>% filter(diff_days <= 350), aes(color = "0-350"), method = "lm", se = TRUE) +
+  geom_text(data = lm_models, aes(x = x_pos, y = y_pos, 
+                                  label = paste("t½:", round(half_life, 1), "days"), color = model_group),
+            size = 5, fontface = "bold", show.legend = FALSE) +  # Annotate half-life
+  scale_color_manual(values = c("0-100" = "blue", "0-240" = "green", "0-350" = "red")) + 
+  labs(
+    x = "Days Since Vaccination",
+    y = "Log IgG WT Spike Panel (AU/ml)",
+    title = "Log IgG WT Spike vs. Days Since Vaccination (Cumulative LM Models)",
+    color = "Cumulative LM"
+  ) +
+  mitt_tema  # Apply custom theme
+
+
+
+# ==============================
+# 🚀 3. Prepare Long-Form Vaccine Data
+# ==============================
+df_long <- df_fohm %>%
+  filter(Civicnumber %in% df_lab$Civicnumber) %>%
+  pivot_longer(
+    cols = starts_with("vaccine_dose") | starts_with("date_dose"),
+    names_to = c(".value", "dose_number"),
+    names_pattern = "(vaccine_dose|date_dose)(\\d+)"
+  )
+
+# ==============================
+# 🚀 4. Filter & Prepare Cohort Data
+# ==============================
+df_long_cohort <- df_long %>%
+  filter(date_dose >= ymd("2023-09-01"), date_dose <= ymd("2024-02-01")) %>%
+  rename(vaccine_date = date_dose) %>%
+  group_by(Civicnumber) %>%
+  slice_max(order_by = c(Infection_date), with_ties = FALSE) %>%
+  ungroup()
+
+# ==============================
+# 🚀 5. Apply Correct Filtering for Lab Data
+# ==============================
+
+# Merge lab results with vaccine data
+df_tmp <- merge(df_lab, df_fohm, all.x = TRUE)
+
+# Select valid observations based on dose & sampling date conditions
+df_numbers <- df_tmp %>%
+  filter(
+    Sampling.date_S.ELISA >= date_dose7 + 21,
+    (Sampling.date_S.ELISA <= date_dose8) | is.na(date_dose8),
+    (Sampling.date_S.ELISA <= date_dose9) | is.na(date_dose9)
+  ) %>%
+  distinct(Referencenumber_sample_Direkttest, .keep_all = TRUE) %>%
+  select(Referencenumber_sample_Direkttest)
+
+# Filter lab data to include only valid samples
+df_lab <- df_lab %>%
+  filter(Referencenumber_sample_Direkttest %in% df_numbers$Referencenumber_sample_Direkttest)
+
+# Merge vaccine & lab data
+df_total <- merge(df_long_cohort, df_lab) %>%
+  distinct(Civicnumber, Referencenumber_sample_Direkttest, .keep_all = TRUE)
+
+# Compute `diff_days` (time between vaccination & sampling)
+df_samples <- df_total %>%
+  filter(Sampling.date_S.ELISA > vaccine_date + 21, !is.na(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml)) %>%
+  arrange(Civicnumber, Sampling.date_S.ELISA) %>%
+  mutate(diff_days = as.numeric(Sampling.date_S.ELISA - vaccine_date))
+
+# ==============================
+# 🚀 6. Function for Half-Life Calculation
+# ==============================
+calculate_half_life <- function(df, max_days) {
+  filtered <- df %>% filter(diff_days <= max_days)
+  model <- lm(log(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml) ~ diff_days, data = filtered)
+  k <- coef(model)["diff_days"]
+  
+  tibble(
+    model_group = paste0("0-", max_days),
+    half_life = log(2) / abs(k),
+    x_pos = mean(filtered$diff_days, na.rm = TRUE),
+    y_pos = max(log(filtered$IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml), na.rm = TRUE) - 0.2
+  )
+}
+
+# Compute half-life using the correctly filtered dataset
+lm_models <- bind_rows(
+  calculate_half_life(df_samples, 250)
+) %>%
+  mutate(x_pos = case_when(
+    model_group == "0-250" ~ 125
+  ))
+
+# ==============================
+# 🚀 7. Create the Plot
+# ==============================
+ggplot(df_samples %>% filter(diff_days <= 250), aes(x = diff_days, y = log(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml))) +
+  geom_point(alpha = 0.5, color = "black") +  
+  geom_smooth(data = df_samples %>% filter(diff_days <= 250), aes(color = "0-250"), method = "lm", se = TRUE) +
+  
+  # # Add Half-life Text Annotations Dynamically
+  # geom_text(
+  #   data = lm_models, aes(x = x_pos, y = y_pos, label = paste("t½:", round(half_life, 1), "days"), color = model_group),
+  #   size = 5, fontface = "bold", show.legend = FALSE
+  # ) +
+  # 
+  # Custom Colors
+  scale_color_manual(values = c("0-250" = "blue")) + 
+  
+  # Y-axis with original values
+  scale_y_continuous(
+    name = "IgG WT Spike (AU/ml)", 
+    breaks = log(c(100,1000, 10000, 100000)),
+    labels = function(x) format(exp(x), scientific = FALSE, big.mark = ",")
+  ) +
+  
+  labs(
+    x = "Days Since Vaccination",
+    y = "Log IgG WT Spike Panel (AU/ml)",
+    title = "Log IgG WT Spike vs. Days Since Vaccination",
+    color = "Cumulative LM"
+  ) +
+  
+  custom_theme  # Apply custom theme
+
+
+
+ggplot(df_samples %>% filter(diff_days <= 250), aes(x = diff_days, y = log(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml))) +
+  geom_point(alpha = 0.5, color = "black") +  
+  geom_smooth(data = df_samples %>% filter(diff_days <= 250), aes(color = "0-250"), method = "lm", se = TRUE) +
+  
+  # Set x-axis breaks at days 0, 50, 100, 150, and 200
+  scale_x_continuous(limits = c(0, 250), breaks = c(0, 50, 100, 150, 200)) +
+  
+  scale_color_manual(values = c("0-250" = "blue")) + 
+  scale_y_continuous(
+    name = "IgG XBB 1.5 Spike Panel (AU/ml)", 
+    breaks = log(c(100, 1000, 10000, 100000)),
+    labels = function(x) format(exp(x), scientific = FALSE, big.mark = "")
+  ) +
+  labs(
+    x = "Days Since Vaccination",
+    y = "IgG XBB 1.5 Spike Panel (AU/ml)",
+    title = element_blank(),
+    color = "Cumulative LM"
+  ) + theme_bw() +
+  custom_theme+
+  custom_theme +theme(legend.position = "none")
+
+############### New style
+
+
+
+
+
+
+
+
+
+
+# Dose 8 half life analysis
+# ==============================
+# 🚀 3. Prepare Vaccine Data (Long Format)
+# ==============================
+df_long <- df_fohm %>%
+  filter(Civicnumber %in% df_lab$Civicnumber) %>%
+  pivot_longer(
+    cols = starts_with("vaccine_dose") | starts_with("date_dose"),
+    names_to = c(".value", "dose_number"),
+    names_pattern = "(vaccine_dose|date_dose)(\\d+)"
+  )
+
+# ==============================
+# 🚀 4. Select Cohort: Vaccinated Between 2024-03-01 and 2024-07-01
+# ==============================
+df_long_cohort <- df_long %>%
+  filter(date_dose >= ymd("2024-03-01"), date_dose <= ymd("2024-07-01")) %>%
+  rename(vaccine_date = date_dose) %>%
+  group_by(Civicnumber) %>%
+  slice_max(order_by = c(Infection_date), with_ties = FALSE) %>%
+  ungroup()
+
+# 🚀 **Split Into Vaccine Groups**
+df_long_comirnaty <- df_long_cohort %>% filter(vaccine_dose == "Comirnaty")
+df_long_nuvaxovid <- df_long_cohort %>% filter(vaccine_dose == "Nuvaxovid")
+
+# ==============================
+# 🚀 5. Merge Lab Data & Filter for Analysis
+# ==============================
+df_tmp <- merge(df_lab, df_fohm, all.x = TRUE)
+
+df_numbers_vaccinated <- df_tmp %>%
+  filter(Sampling.date_S.ELISA >= date_dose4 + 21,
+         (Sampling.date_S.ELISA <= date_dose9) | is.na(date_dose9)) %>%
+  distinct(Referencenumber_sample_Direkttest, .keep_all = TRUE) %>%
+  select(Referencenumber_sample_Direkttest)
+
+df_lab_vaccinated <- df_lab %>%
+  filter(Referencenumber_sample_Direkttest %in% df_numbers_vaccinated$Referencenumber_sample_Direkttest)
+
+df_total_comirnaty <- merge(df_long_comirnaty, df_lab_vaccinated) %>%
+  distinct(Civicnumber, Referencenumber_sample_Direkttest, .keep_all = TRUE)
+
+df_total_nuvaxovid <- merge(df_long_nuvaxovid, df_lab_vaccinated) %>%
+  distinct(Civicnumber, Referencenumber_sample_Direkttest, .keep_all = TRUE)
+
+# ==============================
+# 🚀 6. Compute `diff_days` (Days Since Vaccination)
+# ==============================
+df_samples_comirnaty <- df_total_comirnaty %>%
+  filter(Sampling.date_S.ELISA > vaccine_date + 21, !is.na(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml)) %>%
+  mutate(diff_days = as.numeric(Sampling.date_S.ELISA - vaccine_date),
+         Vaccine = "Comirnaty")
+
+df_samples_nuvaxovid <- df_total_nuvaxovid %>%
+  filter(Sampling.date_S.ELISA > vaccine_date + 21, !is.na(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml)) %>%
+  mutate(diff_days = as.numeric(Sampling.date_S.ELISA - vaccine_date),
+         Vaccine = "Nuvaxovid")
+
+df_samples <- bind_rows(df_samples_comirnaty, df_samples_nuvaxovid)
+
+# ==============================
+# 🚀 7. Compute Half-Life for Each Model
+# ==============================
+fit_lm <- function(df, max_days, vaccine_name) {
+  df_filtered <- df %>% filter(diff_days <= max_days)
+  model <- lm(log(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml) ~ diff_days, data = df_filtered)
+  half_life <- log(2) / abs(coef(model)["diff_days"])
+  
+  tibble(
+    Vaccine = vaccine_name,
+    model_group = paste0("0-", max_days),
+    half_life = round(half_life, 1),
+    x_pos = mean(df_filtered$diff_days, na.rm = TRUE),
+    y_pos = max(log(df_filtered$IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml), na.rm = TRUE) - 0.2
+  )
+}
+
+# Compute for Comirnaty & Nuvaxovid
+lm_results <- bind_rows(
+  fit_lm(df_samples_comirnaty, 250, "Comirnaty"),
+  fit_lm(df_samples_nuvaxovid, 250, "Nuvaxovid")
+) %>%
+  mutate(x_pos = if_else(model_group == "0-100", 60, 160))
+
+# ==============================
+
+
+ggplot(df_samples, aes(x = diff_days, y = log(IgG_CoV.2_Spike.XBB.1.5._PanelCoFlu2_Mesoscale_AU.ml))) +
+  # Scatter Points (only for diff_days <= 250) with color mapped by Vaccine and "0-250"
+  geom_point(data = df_samples %>% filter(diff_days <= 250), 
+             aes(color = paste(Vaccine, "0-250")), alpha = 0.4) +
+  
+  # Regression Lines (for diff_days <= 250)
+  geom_smooth(data = df_samples %>% filter(diff_days <= 250), 
+              aes(color = paste(Vaccine, "0-250")), method = "lm", se = TRUE) +
+  
+  # Set x-axis with the same limits and breaks as the second plot
+  scale_x_continuous(limits = c(0, 250), breaks = c(0, 50, 100, 150, 200)) +
+  
+  # Set y-axis with a log transformation and matching breaks/labels
+  scale_y_continuous(
+    name = "IgG XBB 1.5 Spike Panel (AU/ml)",
+    breaks = log(c(100, 1000, 10000, 100000)),
+    labels = function(x) format(exp(x), scientific = FALSE, big.mark = " ")
+  ) +
+  
+  # Labels & Legend
+  labs(x = "Days Since Vaccination", 
+       y = "IgG XBB 1.5 Spike Panel (AU/ml)", 
+       title = element_blank(),
+       color = "Vaccine") +
+  
+  # Fix colors for the two categories (Vaccine x Time Span)
+  scale_color_manual(values = c("Comirnaty 0-250" = "blue4",
+                                "Nuvaxovid 0-250" = "red4")) +
+  
+  # Apply the same base theme and custom theme as the second plot
+  theme_bw() +
+  custom_theme +theme(legend.position = "none")
+
+
+

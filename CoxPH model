@@ -1,0 +1,368 @@
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3: IDENTIFY VACCINATION GROUPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Extract Nuvaxovid vaccinations administered between Mar 1 and Jul 1, 2024
+nuvaxovid_df <- df_long %>%
+  filter(
+    date_dose   >= ymd("2024-03-01"),
+    date_dose   <= ymd("2024-07-01"),
+    vaccine_dose == "Nuvaxovid"
+  ) %>%
+  rename(vaccine_date = date_dose) %>%  # Standardize column name
+  mutate(Group = "Nuvaxovid")           # Label group
+
+# Extract Comirnaty vaccinations administered in the same period
+comirnaty_df <- df_long %>%
+  filter(
+    date_dose   >= ymd("2024-03-01"),
+    date_dose   <= ymd("2024-07-01"),
+    vaccine_dose == "Comirnaty"
+  ) %>%
+  rename(vaccine_date = date_dose) %>%
+  mutate(Group = "Comirnaty")
+
+# Combine both vaccine groups into one dataset
+df_combined <- bind_rows(nuvaxovid_df, comirnaty_df)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4: SAMPLE CONTROLS TO MATCH VACCINE DATES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Calculate how many vaccinated individuals on each vaccination date
+vaccine_counts <- df_combined %>%
+  group_by(vaccine_date) %>%
+  summarize(n = n(), .groups = "drop")
+
+# Remove any known problematic row (e.g. mismatch)
+vaccine_counts <- vaccine_counts[-105, ]
+
+# Build the pool of eligible controls:
+# - Not vaccinated (not in df_combined)
+# - Appears in FoHM dataset
+# - Alive past 2024-03-01
+eligible_controls <- df_cohort %>%
+  filter(
+    !Civicnumber %in% df_combined$Civicnumber,  
+    Civicnumber %in% df_fohm$Civicnumber        
+  ) %>%
+  left_join(
+    df_fohm %>% select(Civicnumber, Age, gender, Infection_date, Death_date),
+    by = "Civicnumber"
+  ) %>%
+  filter(is.na(Death_date) | Death_date > as.Date("2024-03-01"))
+
+# Seed for reproducible sampling
+set.seed(42)
+
+# Scale control counts proportionally (adjust target sample sizes)
+vaccine_counts <- vaccine_counts %>%
+  mutate(n = pmax(1, floor(n * 8500 / 24651)))  # Ensure at least 1 per date
+
+# Ensure one record per control individual
+eligible_controls <- eligible_controls %>%
+  distinct(Civicnumber, .keep_all = TRUE)
+
+# Iteratively sample controls date by date to match vaccine counts
+sampled_controls <- NULL
+for (i in seq_len(nrow(vaccine_counts))) {
+  date_i <- vaccine_counts$vaccine_date[i]
+  n_i    <- vaccine_counts$n[i]
+  
+  # Filter out already-sampled individuals and ensure alive at start date
+  pool_i <- eligible_controls %>%
+    filter(
+      !Civicnumber %in% sampled_controls$Civicnumber,
+      is.na(Death_date) | Death_date >= date_i
+    )
+  
+  # Sample the required number for this date
+  tmp <- pool_i %>%
+    sample_n(size = min(n_i, nrow(pool_i)), replace = FALSE) %>%
+    mutate(
+      Group             = "Control",
+      start_analysis_date = date_i
+    )
+  
+  sampled_controls <- bind_rows(sampled_controls, tmp)
+}
+
+# Combine controls with vaccine groups
+df_combined <- bind_rows(df_combined, sampled_controls)
+
+# Standardize date columns and set the start of follow-up for each group
+df_combined <- df_combined %>%
+  mutate(
+    vaccine_date         = as.Date(vaccine_date),
+    Infection_date       = as.Date(Infection_date),
+    Death_date           = as.Date(Death_date),
+    start_analysis_date  = case_when(
+      Group %in% c("Comirnaty", "Nuvaxovid") ~ vaccine_date,
+      Group == "Control"                  ~ start_analysis_date,
+      TRUE                                ~ NA_Date_
+    )
+  )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5: BUILD SURVIVAL DATASET AND MERGE COMORBIDITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Define censoring cutoff for analysis
+end_analysis_date <- as.Date("2024-12-12")
+
+# Create a survival dataset with time-to-death (or censoring)
+survival_data_death <- df_combined %>%
+  left_join(df_cci, by = "Civicnumber") %>%     # Add CCIunw & Dementia
+  mutate(
+    # Censor Death_date: if missing or beyond end date, set to day after cutoff
+    Death_date    = if_else(
+      is.na(Death_date) | Death_date > end_analysis_date,
+      end_analysis_date + 1,
+      Death_date
+    ),
+    # Compute days from start to event or censoring
+    Days_to_event = as.numeric(Death_date - start_analysis_date),
+    # Indicator: death occurred within follow-up window?
+    Dead_or_alive = if_else(
+      Death_date > start_analysis_date & Death_date <= end_analysis_date,
+      1, 0
+    )
+  ) %>%
+  # Remove any negative follow-up times
+  filter(Days_to_event >= 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6: FIT COX PROPORTIONAL HAZARDS MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fit a Cox model for death, adjusting for vaccine group, age, gender, CCI, and dementia
+cox_death <- coxph(
+  Surv(Days_to_event, Dead_or_alive) ~ 
+    Group + Age + gender + CCIunw + Dementia,
+  data = survival_data_death
+)
+
+# Export tidy model results to clipboard for quick downstream use (e.g., Excel)
+library(broom)
+write.table(
+  tidy(cox_death),
+  "clipboard",
+  sep = "\t",
+  row.names = FALSE
+)
+
+# Prepare newdata for predicted survival curves:
+# 86-year-old woman, median CCIunw, no dementia, in each study group
+newdata <- data.frame(
+  Group    = c("Control", "Nuvaxovid", "Comirnaty"),
+  Age      = rep(86, 3),
+  gender   = rep("Kvinna", 3),
+  CCIunw   = rep(median(survival_data_death$CCIunw, na.rm = TRUE), 3),
+  Dementia = rep(0, 3),
+  stringsAsFactors = FALSE
+)
+
+# Fit survival curves on the Cox model for our newdata
+surv_pred <- survfit(cox_death, newdata = newdata)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7: PREPARE AND PLOT SURVIVAL CURVES WITH CONFIDENCE INTERVALS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Convert survfit object into a data frame suitable for ggplot2
+surv_pred_df <- data.frame(
+  time  = rep(surv_pred$time, 3),
+  surv  = as.vector(1 - surv_pred$surv),       # Convert to event probability
+  lower = as.vector(1 - surv_pred$upper),      # Upper CI → lower event prob
+  upper = as.vector(1 - surv_pred$lower),      # Lower CI → upper event prob
+  Group = rep(c("Control", "Nuvaxovid", "Comirnaty"), each = length(surv_pred$time))
+)
+
+# Plot stepwise survival curves with shaded confidence intervals
+p_cox <- ggplot(surv_pred_df, aes(x = time, y = surv, color = Group, fill = Group)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, color = NA) +  # CI shading
+  geom_step(size = 1.2) +                                                  # Step plot style
+  labs(
+    title = "Probability of Death for an 86-Year-Old Woman\n(CCIunw median & No Dementia)",
+    x     = "Days After Start of Follow-Up",
+    y     = "Cumulative Probability of Death"
+  ) +
+  mitt_tema +  # Apply our custom theme
+  theme(
+    legend.position = "bottom"
+  )
+
+# Display the plot
+print(p_cox)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6: FIT COX PROPORTIONAL HAZARDS MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+cox_death <- coxph(
+  Surv(Days_to_event, Dead_or_alive) ~ 
+    Group + Age + gender + CCIunw + Dementia,
+  data = survival_data_death
+)
+
+# Export tidy model table to clipboard
+write.table(
+  tidy(cox_death),
+  "clipboard",
+  sep = "\t",
+  row.names = FALSE
+)
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7: DIAGNOSTIC CHECKS FOR COX MODEL ASSUMPTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build a model frame so that residuals and covariates align exactly
+mf <- model.frame(cox_death)
+
+# 1️⃣ Proportional‐Hazards assumption via Schoenfeld residuals
+ph_test <- cox.zph(cox_death)   # formal test (global + per covariate)
+print(ph_test)                  # look for p > 0.05 for each term & global
+
+# Plot the scaled Schoenfeld residuals for the first covariate (Group)
+# (you can also use var=2,3… to plot other terms)
+plot(ph_test, var = 1)
+abline(h = 0, lty = 3)          # reference line at zero
+
+# 2️⃣ Graphical check with complementary log–log (cloglog) survival curves
+fit_km <- survfit(Surv(Days_to_event, Dead_or_alive) ~ Group,
+                  data = survival_data_death)
+
+# Base R plotting to avoid issues with infinite values in ggplot
+plot(
+  fit_km,
+  fun   = "cloglog",             # plots log(-log(survival))
+  col   = 1:length(levels(survival_data_death$Group)),
+  lwd   = 2,
+  xlab  = "Days After Start",
+  ylab  = "log[-log(Survival)]",
+  main  = "Log–Log Survival by Group"
+)
+legend(
+  "bottomleft",
+  legend = levels(survival_data_death$Group),
+  col    = 1:length(levels(survival_data_death$Group)),
+  lty    = 1,
+  lwd    = 2
+)
+
+# 3️⃣ Functional form of continuous covariates via Martingale residuals
+mart_res <- residuals(cox_death, type = "martingale")  # length matches nrow(mf)
+age_mf   <- mf$Age                                    # extract Age from model frame
+
+plot(
+  age_mf, mart_res,
+  pch   = 20,
+  xlab  = "Age",
+  ylab  = "Martingale Residuals",
+  main  = "Martingale Residuals vs. Age"
+)
+# Add a LOESS smooth line to spot non‐linear patterns
+lo <- loess(mart_res ~ age_mf, span = 0.75)
+ord <- order(age_mf)
+lines(
+  age_mf[ord],
+  predict(lo, newdata = data.frame(age_mf = age_mf[ord])),
+  col = "red",
+  lwd = 2
+)
+
+# 4️⃣ Influence diagnostics
+
+# 4a. DFBETA residuals: influence of each subject on each coefficient
+dfb <- residuals(cox_death, type = "dfbeta")
+apply(abs(dfb), 2, summary)   # look for unusually large values in Max.
+
+# 4b. Deviance residuals: identify potential outliers
+dev_res <- residuals(cox_death, type = "deviance")
+plot(
+  dev_res,
+  pch   = 20,
+  ylab  = "Deviance Residuals",
+  main  = "Deviance Residuals"
+)
+abline(h = 0, lty = 3)
+outlier_idx <- which(abs(dev_res) > 2)
+if (length(outlier_idx)) {
+  cat("Potential outlier row indices:", outlier_idx, "\n")
+}
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8: Investigate how a stratified model would performe
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1️⃣ Stratified Cox model (no HR estimated for Group, but PH enforced)
+cox_strat_group <- coxph(
+  Surv(Days_to_event, Dead_or_alive) ~
+    Age + gender + CCIunw + Dementia +
+    strata(Group),
+  data = survival_data_death
+)
+summary(cox_strat_group)
+
+# PH test & plot
+ph_strat <- cox.zph(cox_strat_group)
+print(ph_strat)
+plot(ph_strat)  # check that all p > 0.05
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP X: STANDARDIZED RMST FOR A REFERENCE PATIENT 
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. Create a “reference” patient data frame
+ref <- data.frame(
+  Age      = median(survival_data_death$Age,   na.rm = TRUE),
+  gender   = "Kvinna",   # or the most common level in your data
+  CCIunw   = median(survival_data_death$CCIunw, na.rm = TRUE),
+  Dementia = 0,
+  Group    = c("Control","Nuvaxovid","Comirnaty"),
+  stringsAsFactors = FALSE
+)
+
+# 2. Fit a survfit object for each group
+sf_ctrl <- survfit(cox_strat_group, newdata = ref[ref$Group=="Control", ])
+sf_nuva <- survfit(cox_strat_group, newdata = ref[ref$Group=="Nuvaxovid", ])
+sf_comi <- survfit(cox_strat_group, newdata = ref[ref$Group=="Comirnaty", ])
+
+# 3. Define time grid up to τ = 180 days
+tau       <- 180
+all_times <- seq(0, tau, by = 1)
+
+# 4. Extract survival probabilities at each integer day
+S_ctrl <- summary(sf_ctrl, times = all_times)$surv
+S_nuva <- summary(sf_nuva, times = all_times)$surv
+S_comi <- summary(sf_comi, times = all_times)$surv
+
+# 5. Trapezoidal-rule RMST function
+rmst <- function(surv, times) {
+  sum( (surv[-length(surv)] + surv[-1]) / 2 * diff(times) )
+}
+
+# 6. Compute RMSTs and differences vs. Control
+rmst_ctrl <- rmst(S_ctrl, times = all_times)
+rmst_nuva <- rmst(S_nuva, times = all_times)
+rmst_comi <- rmst(S_comi, times = all_times)
+
+diff_nuva <- rmst_nuva - rmst_ctrl
+diff_comi <- rmst_comi - rmst_ctrl
+
+# 7. Print a summary
+cat(sprintf(
+  "Restricted mean survival to %d days for a reference patient:\n", tau
+))
+cat(sprintf(
+  "  Control   = %.2f days\n  Nuvaxovid = %.2f days (Δ = +%.2f)\n  Comirnaty = %.2f days (Δ = +%.2f)\n",
+  rmst_ctrl, rmst_nuva, diff_nuva, rmst_comi, diff_comi
+))
